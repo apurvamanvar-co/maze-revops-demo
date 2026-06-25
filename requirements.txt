@@ -1,0 +1,3 @@
+streamlit>=1.57
+anthropic>=0.101
+pandas>=2.0
