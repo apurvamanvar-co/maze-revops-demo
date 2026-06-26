@@ -356,7 +356,10 @@ def _get_llm_client():
     global _llm_client
     if _llm_client is None:
         import anthropic
-        _llm_client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
+        # max_retries=0 is deliberate: the SDK default (2) means a rate-limited
+        # call silently fires 3x, AMPLIFYING load during exactly the storm we're
+        # guarding against. A 429 must fail fast and fall back, never retry.
+        _llm_client = anthropic.Anthropic(max_retries=0)  # reads ANTHROPIC_API_KEY from env
     return _llm_client
 
 
@@ -375,62 +378,32 @@ def _rules_based_why_now(lead, base_score):
     return "Solid firmographic fit; little engagement yet."
 
 
-def enrich_lead(lead, base_score):
+def _claude_intent(goal):
+    """Raw Claude call for ONE form-goal string -> (intent_boost, why_now).
+
+    This is the ONLY function that hits the API. It may raise (network /
+    rate-limit / bad JSON); callers catch it and fall back. The client uses
+    max_retries=0, so a 429 fails fast instead of amplifying load. All gating
+    (B+ threshold, key present) and caching happens in the caller (get_full),
+    so this is never reached for a below-threshold lead or a cached goal.
     """
-    Return (intent_boost, why_now) for one lead.
-
-    Only the UNSTRUCTURED field (freetext_goal) is ever sent to Claude. Leads
-    below the LLM threshold, or any failure, fall back to
-    (0, rules-based why_now) so scoring stays cheap and the app stays robust.
-    """
-    # Gate 1 — below the B threshold: not worth an SDR's time or an API call.
-    if base_score < SCORING_CONFIG["llm_threshold"]:
-        return 0, _rules_based_why_now(lead, base_score)
-
-    # Gate 2 — no API key configured: degrade gracefully so the demo still runs.
-    if not os.environ.get("ANTHROPIC_API_KEY"):
-        return 0, _rules_based_why_now(lead, base_score)
-
-    # Pass ONLY the unstructured form free-text — nothing structured.
-    goal = lead["freetext_goal"] or "(no stated goal)"
-    user_msg = f'Lead\'s stated goal (from the lead-capture form): "{goal}"'
-
-    try:
-        resp = _get_llm_client().messages.create(
-            model=LLM_MODEL,
-            max_tokens=LLM_MAX_TOKENS,
-            system=LLM_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        # Pull the text block (don't assume content[0]); strip stray fences.
-        text = next((b.text for b in resp.content if b.type == "text"), "").strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            text = text[text.find("{"):]  # jump to the first '{'
-
-        data = json.loads(text)
-        boost = max(0, min(int(data.get("intent_boost", 0)), 20))  # clamp 0..20
-        why = str(data.get("why_now", "")).strip() or _rules_based_why_now(lead, base_score)
-        return boost, why
-    except Exception:
-        # Network error, bad JSON, unexpected shape — never crash the worklist.
-        return 0, _rules_based_why_now(lead, base_score)
-
-
-def score_and_enrich(lead):
-    """Full scoring path for one lead: rules -> LLM boost -> total -> tier."""
-    base_score, breakdown = score_lead(lead)
-    intent_boost, why_now = enrich_lead(lead, base_score)
-    total = base_score + intent_boost
-    return {
-        "lead": lead,
-        "base_score": base_score,
-        "breakdown": breakdown,
-        "intent_boost": intent_boost,
-        "why_now": why_now,
-        "total_score": total,
-        "tier": tier_for_score(total),
-    }
+    user_msg = (f'Lead\'s stated goal (from the lead-capture form): '
+                f'"{goal or "(no stated goal)"}"')
+    resp = _get_llm_client().messages.create(
+        model=LLM_MODEL,
+        max_tokens=LLM_MAX_TOKENS,
+        system=LLM_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_msg}],
+    )
+    # Pull the text block (don't assume content[0]); strip stray fences.
+    text = next((b.text for b in resp.content if b.type == "text"), "").strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        text = text[text.find("{"):]  # jump to the first '{'
+    data = json.loads(text)
+    boost = max(0, min(int(data.get("intent_boost", 0)), 20))  # clamp 0..20
+    why = str(data.get("why_now", "")).strip()
+    return boost, why
 
 
 # -----------------------------------------------------------------------------
@@ -490,6 +463,30 @@ except Exception:
     pass
 
 
+# --- Optional password gate — protects the public app AND the API key ---------
+# Inert unless APP_PASSWORD is set in Streamlit Secrets. When set, the whole app
+# (and therefore any Claude call) is blocked until the password is entered, so
+# random or bot traffic on the public URL can't reach stage 3 and trigger spend.
+def _require_password():
+    try:
+        required = st.secrets["APP_PASSWORD"] if "APP_PASSWORD" in st.secrets else None
+    except Exception:
+        required = None
+    if not required or st.session_state.get("_authed"):
+        return
+    st.title("🎯 Maze RevOps — Lead Prioritization")
+    pw = st.text_input("Demo password", type="password")
+    if pw == required:
+        st.session_state["_authed"] = True
+        st.rerun()
+    if pw:
+        st.error("Incorrect password.")
+    st.stop()
+
+
+_require_password()
+
+
 # --- Lazy, per-stage computation, held in session_state ----------------------
 # Each get_*() runs its stage at most once per dataset; regenerate() wipes them.
 
@@ -502,10 +499,13 @@ def get_leads():
 
 def regenerate():
     """Draw a fresh dataset and STAY on the Data flood stage showing the new leads.
-    Downstream stages are cleared so they recompute when next reached."""
-    st.session_state.data_version = st.session_state.get("data_version", 0) + 1
-    for k in ("leads", "scored_rules", "scored_full", "ranked"):
+    Downstream stages recompute when next reached. The enriched list is keyed by
+    data_version (bumped here), so it's naturally fresh; goal_cache is intentionally
+    KEPT so repeated goal strings in the new dataset cost ZERO new Claude calls."""
+    old = st.session_state.get("data_version", 0)
+    for k in ("leads", "scored_rules", "ranked", f"scored_full_v{old}", f"stats_v{old}"):
         st.session_state.pop(k, None)
+    st.session_state.data_version = old + 1
     st.session_state.step = 1       # ① Data flood — show the new data right here
     st.session_state.max_step = 1   # collapse downstream chips (stale until recomputed)
 
@@ -522,18 +522,59 @@ def get_rules():
 
 
 def get_full():
-    """Stage 3 — add Claude's read of the unstructured fields. The ONLY place the
-    LLM is called; runs once, when stage 3 is first reached."""
-    if "scored_full" not in st.session_state:
-        full = []
-        with st.spinner("Claude is reading the form goals…"):
-            for r in get_rules():
-                boost, why = enrich_lead(r["lead"], r["base_score"])
-                total = r["base_score"] + boost
-                full.append({**r, "intent_boost": boost, "why_now": why,
-                             "total_score": total, "tier": tier_for_score(total)})
-        st.session_state.scored_full = full
-    return st.session_state.scored_full
+    """Stage 3 — Claude reads the ONE unstructured field (the form goal). This is
+    the ONLY place Claude is called, and it's cached so reruns make ZERO new calls:
+      - the enriched list is cached per dataset (data_version), so Back/Next/filter
+        changes and repeat visits never rebuild it;
+      - each unique goal string's result is cached (goal_cache), so duplicate goals
+        never re-call — and that cache survives Regenerate, since the synthetic goal
+        pool repeats, so a fresh dataset usually needs ZERO new calls.
+    Below-threshold leads and (no key) short-circuit to a fallback with no call.
+    """
+    version = st.session_state.get("data_version", 0)
+    list_key = f"scored_full_v{version}"
+    if list_key in st.session_state:          # already built for this dataset -> no calls
+        return st.session_state[list_key]
+
+    cfg = SCORING_CONFIG
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    goal_cache = st.session_state.setdefault("goal_cache", {})  # goal -> (boost, why) | None=failed
+    st.session_state["enrich_builds"] = st.session_state.get("enrich_builds", 0) + 1
+    calls = reused = bplus = 0
+
+    full = []
+    with st.spinner("Claude is reading the form goals…"):
+        for r in get_rules():
+            lead, base = r["lead"], r["base_score"]
+            if base >= cfg["llm_threshold"]:
+                bplus += 1
+            # HARD GATE: Claude runs ONLY for B+ leads, ONLY with a key. Anything
+            # else short-circuits to a deterministic fallback — no API call.
+            if base < cfg["llm_threshold"] or not has_key:
+                boost, why = 0, _rules_based_why_now(lead, base)
+            else:
+                goal = lead["freetext_goal"]
+                if goal in goal_cache:                       # per-input guard: never re-call
+                    cached = goal_cache[goal]
+                    boost, why = cached if cached else (0, _rules_based_why_now(lead, base))
+                    reused += 1
+                else:
+                    try:
+                        boost, why = _claude_intent(goal)    # the single API call site
+                        why = why or ("Form goal signals concrete intent." if boost > 0
+                                      else "Form goal shows little urgency.")
+                        goal_cache[goal] = (boost, why)
+                    except Exception:                         # 429/network/parse -> fallback, NO retry
+                        boost, why = 0, _rules_based_why_now(lead, base)
+                        goal_cache[goal] = None               # remember the failure; don't retry
+                    calls += 1
+            total = base + boost
+            full.append({**r, "intent_boost": boost, "why_now": why,
+                         "total_score": total, "tier": tier_for_score(total)})
+
+    st.session_state[list_key] = full
+    st.session_state[f"stats_v{version}"] = {"calls": calls, "reused": reused, "bplus": bplus}
+    return full
 
 
 def get_ranked():
@@ -738,10 +779,18 @@ def render_claude():
         "what a rule can't parse."
     )
     eligible = [r for r in full if r["base_score"] >= thr]
+    version = st.session_state.get("data_version", 0)
+    stats = st.session_state.get(f"stats_v{version}", {"calls": 0, "reused": 0})
+    builds = st.session_state.get("enrich_builds", 0)
     c1, c2, c3 = st.columns(3)
-    c1.metric("Leads Claude reviews", len(eligible))
-    c2.metric("Skipped (below B)", len(full) - len(eligible))
-    c3.metric("Model", "claude-sonnet-4-6")
+    c1.metric("B+ leads (Claude-eligible)", len(eligible))
+    c2.metric("🔌 Claude API calls (this dataset)", stats["calls"])
+    c3.metric("Served from cache", stats["reused"])
+    st.caption(
+        f"Calls fire once per *unique* goal, once per dataset (model claude-sonnet-4-6). "
+        f"Reruns, Back/Next, and filter changes add **zero** calls. "
+        f"Enrichment builds this session so far: **{builds}**."
+    )
     st.markdown("**What Claude did with that field:**")
     rows = [{
         "Name": r["lead"]["name"],
